@@ -43,6 +43,48 @@ async fn test_cyclonedx(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Verifies that CycloneDX licenses are split into declared and concluded ones, the way SPDX
+/// `licenseDeclared` and `licenseConcluded` are.
+#[test_context(TrustifyContext)]
+#[test(tokio::test)]
+async fn test_cyclonedx_license_categories(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {
+    // Given components whose licenses carry an acknowledgement, or none at all
+    let result = ctx
+        .ingest_document("cyclonedx/license_categories_1dot7.json")
+        .await?;
+
+    let license_result = LicenseService::new()
+        .license_export(Id::parse_uuid(result.id)?, &ctx.db)
+        .await?;
+
+    let mut licenses = license_result
+        .sbom_package_license
+        .iter()
+        .filter_map(|l| Some((l.name.as_str(), l.license_text.as_deref()?, l.license_type?)))
+        .collect::<Vec<_>>();
+    licenses.sort_unstable_by_key(|(name, text, _)| (*name, *text));
+
+    // Then the acknowledgement decides the category, defaulting to declared, and the licenses
+    // observed as evidence are concluded ones
+    assert_eq!(
+        licenses,
+        [
+            ("concluded", "Apache-2.0", LicenseCategory::Concluded),
+            ("declared", "MIT", LicenseCategory::Declared),
+            (
+                "expression",
+                "Apache-2.0 AND MIT",
+                LicenseCategory::Concluded
+            ),
+            ("observed", "BSD-3-Clause", LicenseCategory::Concluded),
+            ("observed", "MIT", LicenseCategory::Declared),
+            ("unspecified", "MIT", LicenseCategory::Declared),
+        ]
+    );
+
+    Ok(())
+}
+
 #[test_context(TrustifyContext)]
 #[test(tokio::test)]
 async fn test_spdx(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {

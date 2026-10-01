@@ -24,10 +24,15 @@ use sbom_walker::{
 };
 use sea_orm::ConnectionTrait;
 use serde_cyclonedx::cyclonedx::v_1_7::{
-    Attachment, Component, ComponentEvidenceIdentity, CycloneDx, License, LicenseChoiceItemUrl,
-    OrganizationalContact,
+    Attachment, Component, ComponentEvidenceIdentity, CycloneDx, License,
+    LicenseAcknowledgementEnumeration, LicenseChoice, LicenseChoiceItemUrl, MetadataTools,
+    OrganizationalContact, OrganizationalEntity,
 };
-use std::{borrow::Cow, collections::HashMap, str::FromStr};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 use time::{OffsetDateTime, format_description::well_known::Iso8601};
 use tracing::instrument;
 use trustify_common::{advisory::cyclonedx::extract_properties_json, cpe::Cpe, purl::Purl};
@@ -51,6 +56,82 @@ fn from_contact(contact: &OrganizationalContact) -> Option<String> {
         (Some(name), None) => Some(name.to_string()),
         (None, Some(email)) => Some(email.to_string()),
         (None, None) => None,
+    }
+}
+
+/// Name an organization: by name, else by its contacts, else by its URLs.
+fn from_organization(organization: &OrganizationalEntity) -> Vec<String> {
+    organization
+        .name
+        .clone()
+        .map(|name| vec![name])
+        .or_else(|| {
+            organization
+                .contact
+                .as_ref()
+                .map(|c| c.iter().filter_map(from_contact).collect())
+        })
+        .or_else(|| organization.url.clone())
+        .unwrap_or_default()
+}
+
+/// Name the tools which created the document, as `name-version`.
+///
+/// SPDX records its tools as `Tool:` creators, alongside the people and organizations which
+/// created the document. CycloneDX keeps them apart in `metadata.tools`, so we fold them into the
+/// authors to end up with the same set of creators either way.
+fn from_tools(tools: &MetadataTools) -> Vec<String> {
+    fn label(name: &str, version: Option<&str>) -> String {
+        match version {
+            Some(version) => format!("{name}-{version}"),
+            None => name.to_string(),
+        }
+    }
+
+    match tools {
+        // tools described as components and services
+        MetadataTools::Variant0(tools) => tools
+            .components
+            .iter()
+            .flatten()
+            .map(|c| label(&c.name, c.version.as_deref()))
+            .chain(
+                tools
+                    .services
+                    .iter()
+                    .flatten()
+                    .map(|s| label(&s.name, s.version.as_deref())),
+            )
+            .collect(),
+        // the legacy, flat list of tools
+        MetadataTools::Variant1(tools) => tools
+            .iter()
+            .filter_map(|tool| Some(label(tool.name.as_deref()?, tool.version.as_deref())))
+            .collect(),
+    }
+}
+
+/// Drop duplicates, keeping the first occurrence.
+fn dedup(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+/// Map a CycloneDX license acknowledgement onto the category we store it under.
+///
+/// The acknowledgement is optional; `default` is what the containing field implies when it is
+/// absent.
+fn license_category(
+    acknowledgement: Option<&LicenseAcknowledgementEnumeration>,
+    default: LicenseCategory,
+) -> LicenseCategory {
+    match acknowledgement {
+        Some(LicenseAcknowledgementEnumeration::Declared) => LicenseCategory::Declared,
+        Some(LicenseAcknowledgementEnumeration::Concluded) => LicenseCategory::Concluded,
+        None => default,
     }
 }
 
@@ -84,38 +165,43 @@ impl<'a> From<Information<'a>> for SbomInformation {
                 OffsetDateTime::parse(timestamp.as_ref(), &Iso8601::DEFAULT).ok()
             });
 
-        let authors = sbom
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.authors.as_ref())
-            .into_iter()
-            .flatten()
-            .filter_map(from_contact)
-            .collect();
+        // authors: the people who created the document, plus the tools which did
 
-        // supplier
+        let authors = dedup(
+            sbom.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.authors.as_ref())
+                .into_iter()
+                .flatten()
+                .filter_map(from_contact)
+                .chain(
+                    sbom.metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.tools.as_ref())
+                        .into_iter()
+                        .flat_map(from_tools),
+                ),
+        );
 
-        let suppliers = sbom
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.supplier.as_ref())
-            .into_iter()
-            .flat_map(|oe| {
-                // try name first
-                oe.name
-                    .clone()
-                    .map(|name| vec![name])
-                    .or_else(|| {
-                        // then contact
-                        oe.contact
+        // suppliers: of the document, and of the component it describes
+        //
+        // SPDX only knows the latter, as it collects the suppliers of the packages describing the
+        // document. In CycloneDX that is `metadata.component`.
+
+        let suppliers = dedup(
+            sbom.metadata
+                .as_ref()
+                .into_iter()
+                .flat_map(|metadata| {
+                    metadata.supplier.iter().chain(
+                        metadata
+                            .component
                             .as_ref()
-                            .map(|c| c.iter().filter_map(from_contact).collect())
-                    })
-                    // last URL
-                    .or_else(|| oe.url.clone())
-            })
-            .flatten()
-            .collect();
+                            .and_then(|component| component.supplier.as_ref()),
+                    )
+                })
+                .flat_map(from_organization),
+        );
 
         let name = sbom
             .metadata
@@ -284,21 +370,15 @@ impl<'a> Creator<'a> {
     }
 
     pub fn add_all(&mut self, components: &'a Option<Vec<Component>>) {
-        self.extend(components.iter().flatten())
+        self.components.extend(components.iter().flatten())
     }
 
+    /// Record a component.
+    ///
+    /// Components nested inside it are picked up by [`ComponentCreator::add_component`], which
+    /// also relates them to this one.
     pub fn add(&mut self, component: &'a Component) {
         self.components.push(component);
-        self.extend(component.components.iter().flatten());
-    }
-
-    pub fn extend<I>(&mut self, i: I)
-    where
-        I: IntoIterator<Item = &'a Component>,
-    {
-        for c in i.into_iter() {
-            self.add(c);
-        }
     }
 
     pub fn relate(&mut self, left: String, rel: Relationship, right: String) {
@@ -314,7 +394,7 @@ impl<'a> Creator<'a> {
         let mut creator = ComponentCreator::new(self.sbom_id, self.components.len());
 
         for comp in self.components {
-            creator.add_component(comp)?;
+            let _ = creator.add_component(comp)?;
         }
 
         for (left, rel, right) in self.relations {
@@ -368,13 +448,17 @@ impl ComponentCreator {
         }
     }
 
-    pub fn add_component(&mut self, comp: &Component) -> Result<(), Error> {
+    /// Record a component, everything nested inside it, and its pedigree.
+    ///
+    /// Returns the node id the component was recorded under, which is its `bom-ref` unless it
+    /// doesn't have one.
+    pub fn add_component(&mut self, comp: &Component) -> Result<String, Error> {
         let node_id = comp
             .bom_ref
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let licenses_uuid = self.add_license(comp);
+        let licenses = self.add_license(comp);
 
         if let Some(cpe) = &comp.cpe {
             match Cpe::from_str(cpe.as_ref()) {
@@ -424,33 +508,11 @@ impl ComponentCreator {
             }
         }
 
-        let cyclone_licenses = licenses_uuid
-            .iter()
-            .map(|l| PackageLicensenInfo {
-                license_id: *l,
-                license_type: LicenseCategory::Declared,
-            })
-            .collect::<Vec<_>>();
-
         match ComponentType::from_str(&comp.type_) {
             Ok(ty) => {
                 use ComponentType::*;
                 const EMPTY: Vec<PackageReference> = vec![];
                 match ty {
-                    // We treat all these types as "packages"
-                    Application | Framework | Library | Container | OperatingSystem => {
-                        self.packages.add(
-                            NodeInfoParam {
-                                node_id: node_id.clone(),
-                                name: comp.name.to_string(),
-                                group: comp.group.as_ref().map(|v| v.to_string()),
-                                version: comp.version.as_ref().map(|v| v.to_string()),
-                                package_license_info: cyclone_licenses,
-                            },
-                            self.refs.get(&node_id).unwrap_or(&EMPTY).iter(),
-                            comp.hashes.clone().into_iter().flatten(),
-                        )
-                    }
                     File => {
                         self.files.add(
                             node_id.clone(),
@@ -475,7 +537,20 @@ impl ComponentCreator {
                             comp.try_into()?,
                         );
                     }
-                    _ => log::error!("Unsupported component type: '{ty}'"),
+                    // Everything else becomes a "package". Types like `device` or `firmware`
+                    // have no table of their own, but dropping them would leave the
+                    // relationships pointing at them dangling, failing the whole document.
+                    _ => self.packages.add(
+                        NodeInfoParam {
+                            node_id: node_id.clone(),
+                            name: comp.name.to_string(),
+                            group: comp.group.as_ref().map(|v| v.to_string()),
+                            version: comp.version.as_ref().map(|v| v.to_string()),
+                            package_license_info: licenses,
+                        },
+                        self.refs.get(&node_id).unwrap_or(&EMPTY).iter(),
+                        comp.hashes.clone().into_iter().flatten(),
+                    ),
                 }
             }
             Err(e) => {
@@ -485,17 +560,21 @@ impl ComponentCreator {
             }
         }
 
+        // Nested components are an assembly: the component is made up of its parts. That is the
+        // same idea as an SPDX `CONTAINS` relationship, and unrelated to dependencies.
+
+        for nested in comp.components.iter().flatten() {
+            let target = self.add_component(nested)?;
+
+            self.add_relation(node_id.clone(), Relationship::Contains, target);
+        }
+
         for ancestor in comp
             .pedigree
             .iter()
             .flat_map(|pedigree| pedigree.ancestors.iter().flatten())
         {
-            let target = ancestor
-                .bom_ref
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-            self.add_component(ancestor)?;
+            let target = self.add_component(ancestor)?;
 
             self.add_relation(target, Relationship::AncestorOf, node_id.clone());
         }
@@ -505,17 +584,12 @@ impl ComponentCreator {
             .iter()
             .flat_map(|pedigree| pedigree.variants.iter().flatten())
         {
-            let target = variant
-                .bom_ref
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-            self.add_component(variant)?;
+            let target = self.add_component(variant)?;
 
             self.add_relation(node_id.clone(), Relationship::Variant, target);
         }
 
-        Ok(())
+        Ok(node_id)
     }
 
     fn add_relation(&mut self, left: String, rel: Relationship, right: String) {
@@ -539,14 +613,44 @@ impl ComponentCreator {
         self.purls.add(purl);
     }
 
-    fn add_license(&mut self, component: &Component) -> Vec<Uuid> {
-        let mut license_uuid = vec![];
-        for license in component.licenses.iter().flatten() {
-            let license = match license {
+    /// Collect the licenses of a component, split into declared and concluded ones.
+    fn add_license(&mut self, component: &Component) -> Vec<PackageLicensenInfo> {
+        let mut result = vec![];
+
+        // The licenses asserted for the component. An item may say whether that assertion is
+        // declared or concluded; when it doesn't, we keep treating it as declared.
+        self.add_licenses(
+            component.licenses.as_ref(),
+            LicenseCategory::Declared,
+            &mut result,
+        );
+
+        // The licenses observed while analysing the component. Being the outcome of an analysis,
+        // they are what SPDX calls a concluded license.
+        self.add_licenses(
+            component
+                .evidence
+                .as_ref()
+                .and_then(|evidence| evidence.licenses.as_ref()),
+            LicenseCategory::Concluded,
+            &mut result,
+        );
+
+        result
+    }
+
+    fn add_licenses(
+        &mut self,
+        licenses: Option<&LicenseChoice>,
+        default: LicenseCategory,
+        result: &mut Vec<PackageLicensenInfo>,
+    ) {
+        for license in licenses.into_iter().flatten() {
+            let (license, acknowledgement) = match license {
                 LicenseChoiceItemUrl::Variant0(license) => {
                     self.add_licensing_info(&license.license);
 
-                    let Some(license) = license
+                    let Some(name) = license
                         .license
                         .id
                         .clone()
@@ -554,17 +658,30 @@ impl ComponentCreator {
                     else {
                         continue;
                     };
-                    license
+                    (name, license.license.acknowledgement.as_ref())
                 }
-                LicenseChoiceItemUrl::Variant1(license) => license.expression.clone(),
+                LicenseChoiceItemUrl::Variant1(license) => {
+                    (license.expression.clone(), license.acknowledgement.as_ref())
+                }
             };
 
             let license = LicenseInfo { license };
+            let info = PackageLicensenInfo {
+                license_id: license.uuid(),
+                license_type: license_category(acknowledgement, default),
+            };
+
+            // the same license may be listed more than once under the same category
+            if result
+                .iter()
+                .any(|l| l.license_id == info.license_id && l.license_type == info.license_type)
+            {
+                continue;
+            }
 
             self.licenses.add(&license);
-            license_uuid.push(license.uuid());
+            result.push(info);
         }
-        license_uuid
     }
 
     /// Record a license's extended details (name, text, URL) in `licensing_infos`, so that

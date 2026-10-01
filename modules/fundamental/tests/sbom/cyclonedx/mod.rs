@@ -1,3 +1,4 @@
+mod assemblies;
 mod corner_cases;
 mod cpe;
 mod external;

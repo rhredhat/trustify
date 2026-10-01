@@ -1,0 +1,107 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "version": 1,
+  "metadata": {
+    "timestamp": "1970-01-01T13:30:00Z",
+    "component": {
+      "name": "license-categories",
+      "bom-ref": "root",
+      "type": "application"
+    }
+  },
+  "components": [
+    {
+      "name": "unspecified",
+      "version": "1",
+      "bom-ref": "unspecified",
+      "purl": "pkg:rpm/redhat/unspecified@0.0.0?arch=src",
+      "type": "library",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "name": "declared",
+      "version": "1",
+      "bom-ref": "declared",
+      "purl": "pkg:rpm/redhat/declared@0.0.0?arch=src",
+      "type": "library",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT",
+            "acknowledgement": "declared"
+          }
+        }
+      ]
+    },
+    {
+      "name": "concluded",
+      "version": "1",
+      "bom-ref": "concluded",
+      "purl": "pkg:rpm/redhat/concluded@0.0.0?arch=src",
+      "type": "library",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0",
+            "acknowledgement": "concluded"
+          }
+        }
+      ]
+    },
+    {
+      "name": "expression",
+      "version": "1",
+      "bom-ref": "expression",
+      "purl": "pkg:rpm/redhat/expression@0.0.0?arch=src",
+      "type": "library",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 AND MIT",
+          "acknowledgement": "concluded"
+        }
+      ]
+    },
+    {
+      "name": "observed",
+      "version": "1",
+      "bom-ref": "observed",
+      "purl": "pkg:rpm/redhat/observed@0.0.0?arch=src",
+      "type": "library",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "evidence": {
+        "licenses": [
+          {
+            "license": {
+              "id": "BSD-3-Clause"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "root",
+      "dependsOn": [
+        "unspecified",
+        "declared",
+        "concluded",
+        "expression",
+        "observed"
+      ]
+    }
+  ]
+}

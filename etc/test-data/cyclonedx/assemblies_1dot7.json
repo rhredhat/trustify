@@ -1,0 +1,77 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "version": 1,
+  "metadata": {
+    "timestamp": "1970-01-01T13:30:00Z",
+    "component": {
+      "name": "appliance",
+      "bom-ref": "appliance",
+      "type": "device"
+    },
+    "authors": [
+      {
+        "name": "Some Author"
+      }
+    ],
+    "tools": {
+      "components": [
+        {
+          "name": "assembler",
+          "type": "application",
+          "version": "1.2.3"
+        }
+      ]
+    },
+    "supplier": {
+      "name": "Some Supplier"
+    }
+  },
+  "components": [
+    {
+      "name": "board",
+      "bom-ref": "board",
+      "type": "device",
+      "components": [
+        {
+          "name": "bios",
+          "bom-ref": "bios",
+          "version": "2.0",
+          "type": "firmware"
+        },
+        {
+          "name": "driver",
+          "bom-ref": "driver",
+          "type": "device-driver",
+          "components": [
+            {
+              "name": "blob",
+              "bom-ref": "blob",
+              "type": "data"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "runtime",
+      "bom-ref": "runtime",
+      "type": "platform"
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "appliance",
+      "dependsOn": [
+        "board",
+        "runtime"
+      ]
+    },
+    {
+      "ref": "driver",
+      "dependsOn": [
+        "bios"
+      ]
+    }
+  ]
+}
